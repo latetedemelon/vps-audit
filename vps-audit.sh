@@ -13,6 +13,38 @@ NC='\033[0m' # No Color
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 REPORT_FILE="vps-audit-report-${TIMESTAMP}.txt"
 
+# ---- machine-readable / gating options (added for vps-lockdown integration) ----
+# Read-only by design: --json changes only OUTPUT, never the system.
+JSON_MODE="no"
+for arg in "$@"; do
+    case "$arg" in
+        --json) JSON_MODE="yes" ;;
+        -h|--help)
+            echo "Usage: vps-audit.sh [--json]"
+            echo "  --json   Emit results as JSON on stdout (human output goes to stderr)."
+            echo "Exit code: 0 if no critical check failed, 2 if any CRITICAL check FAILed."
+            exit 0 ;;
+    esac
+done
+
+# A FAIL on a CRITICAL check is severe enough to block an automated
+# 'harden, then audit' roll-forward (consumed by vps-lockdown's audit gate).
+is_critical_check() {
+    case "$1" in
+        "SSH Root Login"|"SSH Password Auth"|"Fail2ban") return 0 ;;
+        "Firewall Status"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+JSON_RESULTS=""
+CRIT_FAILS=0
+TOTAL_FAILS=0
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\r//g'; }
+
+# In JSON mode route all human output to stderr; only JSON is printed on stdout.
+if [ "$JSON_MODE" = "yes" ]; then exec 3>&1 1>&2; fi
+
 print_header() {
     local header="$1"
     echo -e "\n${BLUE}${BOLD}$header${NC}"
@@ -70,12 +102,15 @@ echo "" >> "$REPORT_FILE"
 # Security Audit Section
 print_header "Security Audit Results"
 
-# Function to check and report with three states
+# Function to check and report with three states (also records results for --json
+# and tracks critical failures for the gating exit code).
 check_security() {
     local test_name="$1"
     local status="$2"
     local message="$3"
-    
+    local crit="false"
+    if is_critical_check "$test_name"; then crit="true"; fi
+
     case $status in
         "PASS")
             echo -e "${GREEN}[PASS]${NC} $test_name ${GRAY}- $message${NC}"
@@ -88,9 +123,15 @@ check_security() {
         "FAIL")
             echo -e "${RED}[FAIL]${NC} $test_name ${GRAY}- $message${NC}"
             echo "[FAIL] $test_name - $message" >> "$REPORT_FILE"
+            TOTAL_FAILS=$((TOTAL_FAILS+1))
+            [ "$crit" = "true" ] && CRIT_FAILS=$((CRIT_FAILS+1))
             ;;
     esac
     echo "" >> "$REPORT_FILE"
+
+    local item
+    item="{\"name\":\"$(json_escape "$test_name")\",\"status\":\"$status\",\"critical\":$crit,\"message\":\"$(json_escape "$message")\"}"
+    if [ -z "$JSON_RESULTS" ]; then JSON_RESULTS="$item"; else JSON_RESULTS="$JSON_RESULTS,$item"; fi
 }
 
 
@@ -189,28 +230,8 @@ check_firewall_status() {
     fi
 }
 
-# Function to check and report with three states
-check_security() {
-    local test_name="$1"
-    local status="$2"
-    local message="$3"
-
-    case $status in
-        "PASS")
-            echo -e "${GREEN}[PASS]${NC} $test_name ${GRAY}- $message${NC}"
-            echo "[PASS] $test_name - $message" >> "$REPORT_FILE"
-            ;;
-        "WARN")
-            echo -e "${YELLOW}[WARN]${NC} $test_name ${GRAY}- $message${NC}"
-            echo "[WARN] $test_name - $message" >> "$REPORT_FILE"
-            ;;
-        "FAIL")
-            echo -e "${RED}[FAIL]${NC} $test_name ${GRAY}- $message${NC}"
-            echo "[FAIL] $test_name - $message" >> "$REPORT_FILE"
-            ;;
-    esac
-    echo "" >> "$REPORT_FILE"
-}
+# (Duplicate check_security definition removed; the enhanced version above is used
+# for every check, so all results are recorded for --json and gating.)
 
 # Firewall check
 check_firewall_status
@@ -377,3 +398,17 @@ echo -e "Review $REPORT_FILE for detailed recommendations."
 echo "================================" >> "$REPORT_FILE"
 echo "End of VPS Audit Report" >> "$REPORT_FILE"
 echo "Please review all failed checks and implement the recommended fixes." >> "$REPORT_FILE"
+
+# ---- machine-readable output + gating exit code ----
+# Emit JSON on stdout when requested, then exit non-zero if any CRITICAL check
+# FAILed so callers (e.g. vps-lockdown's audit gate) can block roll-forward.
+if [ "$JSON_MODE" = "yes" ]; then
+    exec 1>&3
+    printf '{"critical_fails":%s,"total_fails":%s,"results":[%s]}\n' \
+        "$CRIT_FAILS" "$TOTAL_FAILS" "$JSON_RESULTS"
+fi
+
+if [ "$CRIT_FAILS" -gt 0 ]; then
+    exit 2
+fi
+exit 0

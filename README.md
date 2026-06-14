@@ -65,6 +65,23 @@ Run the script with sudo privileges:
 sudo ./vps-audit.sh
 ```
 
+### Machine-readable output (`--json`)
+
+For automation and CI (and for use as a gate by `vps-lockdown`), run with `--json`:
+
+```bash
+sudo ./vps-audit.sh --json
+```
+
+- Emits a single JSON object on **stdout** (human-readable output is redirected to
+  stderr), e.g. `{"critical_fails":N,"total_fails":M,"results":[{"name":...,"status":"PASS|WARN|FAIL","critical":true|false,"message":...}]}`.
+- This is **read-only** like the rest of the script — `--json` changes only the
+  output, never the system.
+- **Exit code:** `0` when no critical check failed, `2` when any *critical* check
+  FAILed (currently: SSH root login, SSH password auth, firewall status,
+  fail2ban). This lets a caller block an automated "harden, then audit"
+  roll-forward.
+
 The script will:
 
 1. Perform all security checks
